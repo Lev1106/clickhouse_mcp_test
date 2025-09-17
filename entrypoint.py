@@ -1,11 +1,11 @@
 import os
 import re
-import sys
-from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel
+import json
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
+from sse_starlette.sse import EventSourceResponse
 import clickhouse_connect
 
-# ==== Настройки ====
 CLICKHOUSE_HOST = os.getenv("CLICKHOUSE_HOST")
 CLICKHOUSE_PORT = int(os.getenv("CLICKHOUSE_PORT", "8123"))
 CLICKHOUSE_USER = os.getenv("CLICKHOUSE_USER")
@@ -14,68 +14,75 @@ CLICKHOUSE_SECURE = os.getenv("CLICKHOUSE_SECURE", "false").lower() == "true"
 CLICKHOUSE_VERIFY = os.getenv("CLICKHOUSE_VERIFY", "false").lower() == "true"
 API_KEY = os.getenv("MCP_API_KEY", "supersecret")
 
-# ==== Инициализация клиента ====
-try:
-	client = clickhouse_connect.get_client(
-		host=CLICKHOUSE_HOST,
-		port=CLICKHOUSE_PORT,
-		username=CLICKHOUSE_USER,
-		password=CLICKHOUSE_PASSWORD,
-		secure=CLICKHOUSE_SECURE,
-		verify=CLICKHOUSE_VERIFY
-	)
-except Exception as e:
-	print(f"[BOOT ERROR] Failed to init ClickHouse client: {e}", file=sys.stderr)
-	client = None  # чтобы не упасть на старте
-
-# ==== Валидация SQL ====
-FORBIDDEN = (
-	"insert", "alter", "drop", "truncate", "optimize",
-	"attach", "rename", "create", "delete", "system", "grant", "revoke"
+client = clickhouse_connect.get_client(
+    host=CLICKHOUSE_HOST,
+    port=CLICKHOUSE_PORT,
+    username=CLICKHOUSE_USER,
+    password=CLICKHOUSE_PASSWORD,
+    secure=CLICKHOUSE_SECURE,
+    verify=CLICKHOUSE_VERIFY
 )
-ALLOWED_START = re.compile(r"^\s*select\b", re.IGNORECASE)
+
+FORBIDDEN = (
+    "insert", "alter", "drop", "truncate", "optimize",
+    "attach", "rename", "create", "delete", "system", "grant", "revoke"
+)
+SELECT_RE = re.compile(r"^\s*select\b", re.IGNORECASE)
 
 def validate_sql(sql: str):
-	norm = sql.strip().lower()
-	if not ALLOWED_START.match(norm):
-		raise HTTPException(status_code=400, detail="Only SELECT statements allowed")
-	for kw in FORBIDDEN:
-		if kw in norm:
-			raise HTTPException(status_code=400, detail=f"Forbidden keyword: {kw}")
+    norm = sql.strip().lower()
+    if not SELECT_RE.match(norm):
+        raise ValueError("Only SELECT statements allowed")
+    for kw in FORBIDDEN:
+        if kw in norm:
+            raise ValueError(f"Forbidden keyword: {kw}")
 
-# ==== FastAPI ====
 app = FastAPI()
 
-class SQLRequest(BaseModel):
-	sql: str
-	limit: int | None = 1000
+@app.get("/sse")
+async def sse_endpoint(request: Request):
+    async def event_generator():
+        # Handshake: отправляем список tools
+        tools_list = {
+            "type": "tools/list",
+            "tools": [
+                {
+                    "name": "query",
+                    "description": "Run read-only SELECT SQL on ClickHouse",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "sql": {"type": "string"}
+                        },
+                        "required": ["sql"]
+                    }
+                }
+            ]
+        }
+        yield {"event": "message", "data": json.dumps(tools_list)}
 
-@app.post("/query")
-def run_query(req: SQLRequest, x_api_key: str = Header(None)):
-	if x_api_key != API_KEY:
-		raise HTTPException(status_code=401, detail="Invalid API key")
-	if client is None:
-		raise HTTPException(status_code=500, detail="ClickHouse client not initialized")
-	validate_sql(req.sql)
+        async for body in request.stream():
+            try:
+                event = json.loads(body.decode())
+                if event.get("type") == "tools/call" and event["name"] == "query":
+                    sql = event["arguments"]["sql"]
+                    validate_sql(sql)
+                    result = client.query(sql, settings={"readonly": 1, "max_execution_time": 8})
+                    rows = [dict(zip(result.column_names, r)) for r in result.result_rows]
+                    response = {
+                        "type": "tools/response",
+                        "name": "query",
+                        "content": {"rows": rows, "count": len(rows)},
+                        "call_id": event["call_id"]
+                    }
+                    yield {"event": "message", "data": json.dumps(response)}
+            except Exception as e:
+                err = {
+                    "type": "tools/response",
+                    "name": "query",
+                    "error": str(e)
+                }
+                yield {"event": "message", "data": json.dumps(err)}
 
-	try:
-		result = client.query(
-			req.sql,
-			settings={
-				"readonly": 1,
-				"max_execution_time": 8,
-				"max_result_rows": req.limit or 5000,
-				"result_overflow_mode": "throw"
-			}
-		)
-	except Exception as e:
-		print(f"[QUERY ERROR] SQL failed: {req.sql} | {e}", file=sys.stderr)
-		raise HTTPException(status_code=400, detail=f"ClickHouse error: {e}")
+    return EventSourceResponse(event_generator())
 
-	rows = result.result_rows
-	print(f"[QUERY OK] rows={len(rows)} sql={req.sql[:80]}...", file=sys.stderr)
-	return {"rows": rows, "count": len(rows)}
-
-@app.get("/ping")
-def ping():
-	return {"status": "ok"}

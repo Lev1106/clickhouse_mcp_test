@@ -1,5 +1,6 @@
 fastapi
 uvicorn[standard]
 clickhouse-connect
-numpy>=2.0
+sse-starlette
+pydantic
 
