@@ -1,8 +1,8 @@
 import os
 import re
 import json
+import asyncio
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
 from sse_starlette.sse import EventSourceResponse
 import clickhouse_connect
 
@@ -38,11 +38,12 @@ def validate_sql(sql: str):
             raise ValueError(f"Forbidden keyword: {kw}")
 
 app = FastAPI()
+event_queue = asyncio.Queue()
 
 @app.get("/sse")
-async def sse_endpoint(request: Request):
+async def sse_endpoint():
     async def event_generator():
-        # Handshake: отправляем список tools
+        # Сначала объявляем tools
         tools_list = {
             "type": "tools/list",
             "tools": [
@@ -51,9 +52,7 @@ async def sse_endpoint(request: Request):
                     "description": "Run read-only SELECT SQL on ClickHouse",
                     "input_schema": {
                         "type": "object",
-                        "properties": {
-                            "sql": {"type": "string"}
-                        },
+                        "properties": {"sql": {"type": "string"}},
                         "required": ["sql"]
                     }
                 }
@@ -61,9 +60,10 @@ async def sse_endpoint(request: Request):
         }
         yield {"event": "message", "data": json.dumps(tools_list)}
 
-        async for body in request.stream():
+        # потом ждём события из очереди (от POST)
+        while True:
+            event = await event_queue.get()
             try:
-                event = json.loads(body.decode())
                 if event.get("type") == "tools/call" and event["name"] == "query":
                     sql = event["arguments"]["sql"]
                     validate_sql(sql)
@@ -80,9 +80,15 @@ async def sse_endpoint(request: Request):
                 err = {
                     "type": "tools/response",
                     "name": "query",
-                    "error": str(e)
+                    "error": str(e),
+                    "call_id": event.get("call_id")
                 }
                 yield {"event": "message", "data": json.dumps(err)}
 
     return EventSourceResponse(event_generator())
 
+@app.post("/sse")
+async def sse_post(request: Request):
+    body = await request.json()
+    await event_queue.put(body)
+    return {"status": "accepted"}
