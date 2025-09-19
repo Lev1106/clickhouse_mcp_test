@@ -1,5 +1,5 @@
 import os, re, json, uuid, asyncio
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union, List
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
@@ -12,7 +12,7 @@ CLICKHOUSE_USER = os.getenv("CLICKHOUSE_USER")
 CLICKHOUSE_PASSWORD = os.getenv("CLICKHOUSE_PASSWORD")
 CLICKHOUSE_SECURE = os.getenv("CLICKHOUSE_SECURE", "false").lower() == "true"
 CLICKHOUSE_VERIFY = os.getenv("CLICKHOUSE_VERIFY", "false").lower() == "true"
-API_KEY = os.getenv("MCP_API_KEY")  # оставь пустым, если не нужен
+API_KEY = os.getenv("MCP_API_KEY")  # пусто = без проверки на POST
 
 # ---------- ClickHouse ----------
 client = clickhouse_connect.get_client(
@@ -37,20 +37,20 @@ def validate_sql(sql: str):
         if kw in norm:
             raise ValueError(f"Forbidden keyword: {kw}")
 
-# ---------- MCP plumbing ----------
+# ---------- MCP ----------
 app = FastAPI()
 
-# session_id -> asyncio.Queue
+# session_id -> asyncio.Queue (для опционального SSE)
 sessions: dict[str, asyncio.Queue] = {}
 last_session_id: Optional[str] = None
 
-def queue_for(req: Request) -> asyncio.Queue:
+def queue_for(req: Request) -> Optional[asyncio.Queue]:
     sid = req.headers.get("Mcp-Session-Id")
     if sid and sid in sessions:
         return sessions[sid]
     if last_session_id and last_session_id in sessions:
         return sessions[last_session_id]
-    return asyncio.Queue()
+    return None
 
 def ensure_post_auth(request: Request):
     if not API_KEY:
@@ -72,7 +72,7 @@ QUERY_TOOL = {
 }
 
 def content_text_json(payload: Any) -> Dict[str, Any]:
-    # Требование из гайда: вернуть content как массив с type=text, text = JSON-encoded string
+    # Как в доке: content = [{type:"text", text:"<JSON STRING>"}]
     return {
         "content": [
             {
@@ -82,13 +82,21 @@ def content_text_json(payload: Any) -> Dict[str, Any]:
         ]
     }
 
+def rpc_result(id_: Union[int,str], result_obj: Dict[str, Any]) -> Dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": id_, "result": result_obj}
+
+def rpc_error(id_: Union[int,str], code: int, msg: str) -> Dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": id_, "error": {"code": code, "message": msg}}
+
 @app.get("/")
 async def root():
     return {"ok": True, "service": "mcp-clickhouse"}
 
+# Принимаем /sse и /sse/ (оба)
 @app.get("/sse")
+@app.get("/sse/")
 async def sse_stream(request: Request):
-    # ВАЖНО: GET /sse без проверки ключа — иначе UI часто не открывает поток
+    # GET /sse не требуем ключ, чтобы поток открыт у любого клиента
     session_id = str(uuid.uuid4())
     q: asyncio.Queue = asyncio.Queue()
     sessions[session_id] = q
@@ -117,39 +125,50 @@ async def sse_stream(request: Request):
     resp.headers["Mcp-Session-Id"] = session_id
     return resp
 
+# Принимаем /sse и /sse/ (оба)
 @app.post("/sse")
+@app.post("/sse/")
 async def sse_post(request: Request):
     ensure_post_auth(request)
     body = await request.json()
     print(f"[RPC IN] {body}")
-    if isinstance(body, list):
-        for msg in body:
-            await handle_rpc(msg, request)
-    else:
-        await handle_rpc(body, request)
-    return {"status": "ok"}
 
-async def handle_rpc(msg: Dict[str, Any], request: Request):
+    # Поддержка батча и единичного сообщения
+    if isinstance(body, list):
+        responses: List[Dict[str, Any]] = []
+        for msg in body:
+            resp = await handle_rpc(msg, request)
+            if resp is not None:
+                responses.append(resp)
+        return JSONResponse(responses)
+    else:
+        resp = await handle_rpc(body, request)
+        return JSONResponse(resp if resp is not None else {"jsonrpc":"2.0","result":{}})
+
+async def handle_rpc(msg: Dict[str, Any], request: Request) -> Optional[Dict[str, Any]]:
     jsonrpc = msg.get("jsonrpc", "2.0")
     method = msg.get("method")
     _id = msg.get("id")
-    q = queue_for(request)
+    q = queue_for(request)  # может быть None, если стрима нет
 
     # initialize
     if method == "initialize":
         result = {
             "protocolVersion": "2025-06-18",
             "capabilities": {"tools": {"listChanged": False}},
-            "serverInfo": {"name": "mcp-clickhouse", "version": "0.2.0"},
+            "serverInfo": {"name": "mcp-clickhouse", "version": "0.3.0"},
             "tools": [QUERY_TOOL],
         }
-        await q.put({"jsonrpc": jsonrpc, "id": _id, "result": result})
-        return
+        out = rpc_result(_id, result)
+        if q: await q.put(out)
+        return out
 
     # tools/list
     if method == "tools/list":
-        await q.put({"jsonrpc": jsonrpc, "id": _id, "result": {"tools": [QUERY_TOOL]}})
-        return
+        result = {"tools": [QUERY_TOOL]}
+        out = rpc_result(_id, result)
+        if q: await q.put(out)
+        return out
 
     # tools/call
     if method == "tools/call":
@@ -157,9 +176,9 @@ async def handle_rpc(msg: Dict[str, Any], request: Request):
         name = params.get("name")
         args = params.get("arguments") or {}
         if name != "query":
-            await q.put({"jsonrpc": jsonrpc, "id": _id,
-                         "error": {"code": -32601, "message": f"Unknown tool: {name}"}})
-            return
+            out = rpc_error(_id, -32601, f"Unknown tool: {name}")
+            if q: await q.put(out)
+            return out
         sql = args.get("sql", "")
         try:
             validate_sql(sql)
@@ -170,13 +189,16 @@ async def handle_rpc(msg: Dict[str, Any], request: Request):
             })
             rows = [dict(zip(res.column_names, r)) for r in res.result_rows]
             payload = {"rows": rows, "count": len(rows)}
-            result = {"toolName": "query", **content_text_json(payload)}
-            await q.put({"jsonrpc": jsonrpc, "id": _id, "result": result})
+            result_obj = {"toolName": "query", **content_text_json(payload)}
+            out = rpc_result(_id, result_obj)
+            if q: await q.put(out)
+            return out
         except Exception as e:
-            await q.put({"jsonrpc": jsonrpc, "id": _id,
-                         "error": {"code": -32000, "message": f"{type(e).__name__}: {e}"}})
-        return
+            out = rpc_error(_id, -32000, f"{type(e).__name__}: {e}")
+            if q: await q.put(out)
+            return out
 
     # unknown
-    await q.put({"jsonrpc": jsonrpc, "id": _id,
-                 "error": {"code": -32601, "message": f"Unknown method: {method}"}})
+    out = rpc_error(_id, -32601, f"Unknown method: {method}")
+    if q: await q.put(out)
+    return out
