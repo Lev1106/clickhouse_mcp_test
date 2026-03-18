@@ -227,35 +227,49 @@ app = FastAPI()
 @app.get("/")
 async def root():
     return {"ok": True, "service": "mcp-clickhouse", "endpoint": "/mcp"}
-
+    
 @app.get("/mcp")
 async def mcp_sse(request: Request):
-    # Streamable HTTP допускает GET с text/event-stream
-    validate_origin(request)
+    print("GET /mcp headers =", dict(request.headers))
 
     async def event_generator():
-        # Для коннектора этого уже хватает, чтобы проверка Content-Type проходила.
-        # Если захочешь сервер-initiated notifications, можно расширить.
-        yield {
-            "event": "message",
-            "data": json.dumps({
+        n = 0
+        while True:
+            if await request.is_disconnected():
+                print("GET /mcp disconnected")
+                break
+
+            n += 1
+            msg = {
                 "jsonrpc": "2.0",
                 "method": "ping",
-                "params": {"ok": True}
-            }, ensure_ascii=False)
-        }
+                "params": {"ok": True, "n": n}
+            }
+            print("GET /mcp send =", msg)
+
+            yield {
+                "event": "message",
+                "data": json.dumps(msg, ensure_ascii=False)
+            }
+
+            await asyncio.sleep(15)
 
     return EventSourceResponse(event_generator())
 
 @app.post("/mcp")
 async def mcp_post(request: Request):
-    validate_origin(request)
-    ensure_post_auth(request)
-
     try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
+        raw = await request.body()
+        print("POST /mcp headers =", dict(request.headers))
+        print("POST /mcp body =", raw.decode("utf-8", errors="ignore"))
+
+        validate_origin(request)
+        ensure_post_auth(request)
+
+        body = json.loads(raw)
+    except Exception as e:
+        print("POST /mcp ERROR =", repr(e))
+        raise
 
     if isinstance(body, list):
         responses = []
@@ -263,9 +277,11 @@ async def mcp_post(request: Request):
             resp = await handle_rpc(item)
             if resp is not None:
                 responses.append(resp)
+        print("POST /mcp response =", responses)
         return JSONResponse(responses)
 
     resp = await handle_rpc(body)
+    print("POST /mcp response =", resp)
     return JSONResponse(resp if resp is not None else {"jsonrpc": "2.0", "result": {}})
 
 # =========================================================
